@@ -173,7 +173,7 @@ class ActionDataset(Dataset):
                                                                      frame["targets"][track] else ""
                     for possible_value in annotation_map[track][label]:
                         encoding.append(int(actual_value == possible_value))
-            frame["targets"] = encoding
+            frame["targets"] = torch.tensor(encoding, device="cpu")
 
     def __len__(self):
         return len(self.frames)
