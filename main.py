@@ -8,7 +8,7 @@ import torch.nn.functional
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
-from data_loader import ActionDataset
+from data_loader import load_annotation_map, load_data
 from models import create_model, create_optimizer
 
 LOG_INTERVAL = 1000
@@ -21,7 +21,13 @@ training_loader = None
 validation_loader = None
 loss_fn = None
 
-def get_loss_fn(class_groups):
+
+def get_loss_fn(annotation_map):
+    class_groups = []
+    for track in annotation_map:
+        for attribute in annotation_map[track]:
+            class_groups.append(len(annotation_map[track][attribute]))
+
     def loss_fn(y_true, y_pred):
         groups_y_true = y_true.split(class_groups, -1)
         groups_y_pred = y_pred.split(class_groups, -1)
@@ -29,6 +35,7 @@ def get_loss_fn(class_groups):
         for i in range(len(groups_y_true)):
             loss += torch.nn.functional.cross_entropy(groups_y_true[i], groups_y_pred[i])
         return loss
+
     return loss_fn
 
 
@@ -49,9 +56,12 @@ def train_one_epoch():
         running_loss += loss.item()
         running_loss_epoch += loss.item()
         if i % LOG_INTERVAL == LOG_INTERVAL - 1:
-            print(f"\r  batch {i + 1}, loss: {running_loss / LOG_INTERVAL} ({int((i+1) / len(training_loader) * 100)}%)", end="")
+            print(
+                f"\r  batch {i + 1}, loss: {running_loss / LOG_INTERVAL} ({int((i + 1) / len(training_loader) * 100)}%)",
+                end="")
             running_loss = 0.
     return running_loss_epoch / len(training_loader)
+
 
 def train(epoch_start, epoch_end):
     for epoch in range(epoch_start, epoch_end):
@@ -88,28 +98,28 @@ if __name__ == '__main__':
     # run the script like e.g.:
     # python ./main.py /path/to/dataset -r /eit_data_PCB4 -r /eit_data_PCB5
     argparser = argparse.ArgumentParser()
-    argparser.add_argument("training_set")
-    argparser.add_argument("validation_set")
-    argparser.add_argument("-c", "--config", default="config.yaml")
+    argparser.add_argument("config", default="config.yaml")
     argparser.add_argument("-n", "--name", default="default")
-    argparser.add_argument("-r", "--ros", action="append")
     args = argparser.parse_args()
     name = args.name
     config = yaml.safe_load(open(args.config))
 
     # create data loader
-    training_dataset = ActionDataset(args.training_set, ros_topic_filter=args.ros, transform=transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    data_config = config["data"]
+    annotation_map = load_annotation_map(data_config["specfile"])
+    ros_topics = config["ros_topics"] if "ros_topics" in config else None
+    training_loader = load_data(data_config["training_set"], annotation_map, batch_size=config["batch_size"],
+                                ros_topics=ros_topics, shuffle=True, transform=transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ]))
-    validation_dataset = ActionDataset(args.validation_set, ros_topic_filter=args.ros, annotation_map=training_dataset.annotation_map)
-    training_loader = DataLoader(training_dataset, batch_size=config["batch_size"], shuffle=True)
-    validation_loader = DataLoader(validation_dataset, batch_size=config["batch_size"], shuffle=True)
-    loss_fn = get_loss_fn(training_dataset.class_groups)
+    validation_loader = load_data(data_config["validation_set"], annotation_map, batch_size=config["batch_size"],
+                                  ros_topics=ros_topics, shuffle=True)
+    loss_fn = get_loss_fn(annotation_map)
 
     # create model and optimizer, load checkpoint
-    model = create_model(config["model"], training_dataset.target_size)
+    model = create_model(config["model"], sum(sum(len(y) for y in x.values()) for x in annotation_map.values()))
     optimizer = create_optimizer(config["optimizer"], model.parameters())
     wandb.init()
     try:

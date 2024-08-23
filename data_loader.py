@@ -1,10 +1,13 @@
+from copy import copy
+
 import numpy as np
 import torch
 import os
+import xml.etree.ElementTree as ET
 
-from collections import OrderedDict
 import torchvision.io
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, ConcatDataset, DataLoader
+from collections import OrderedDict
 from pathlib import Path
 from lxml import etree
 from rosbags.highlevel import AnyReader
@@ -88,110 +91,103 @@ def load_anvil_annotation(anvil_file):
     return rows
 
 
-class ActionDataset(Dataset):
-    def __init__(self, root_dir, ros_topic_filter=None, transform=None, annotation_map=None):
+def load_annotation_map(specfile):
+    xml_root = ET.parse(specfile).getroot()
+    assert xml_root.tag == "annotation-spec"
+    # get value sets
+    value_sets = {}
+    for value_set in xml_root.iter("valueset"):
+        name = str.lower(value_set.attrib["name"])
+        value_sets[name] = []
+        for value in value_set.iter("value-el"):
+            value_sets[name].append(str.lower(value.text))
+        value_sets[name].sort()
+    # get tracks
+    annotation_map = OrderedDict()
+
+    def parse_track(track_name, track):
+        track_name += str.lower(track.attrib["name"])
+        annotation_map[track_name] = OrderedDict()
+        for attribute in track.iter("attribute"):
+            attribute_name = str.lower(attribute.attrib["name"])
+            if "valuetype" in attribute.attrib:
+                annotation_map[track_name][attribute_name] = value_sets[str.lower(attribute.attrib["valuetype"])].copy()
+            else:
+                annotation_map[track_name][attribute_name] = []
+                for value in attribute.iter("value-el"):
+                    annotation_map[track_name][attribute_name].append(str.lower(value.text))
+            annotation_map[track_name][attribute_name].append("not present")
+
+    for element in xml_root.find("body"):
+        if element.tag == "group":
+            track_name = str.lower(element.attrib["name"]) + "."
+            for track in element.iter("track-spec"):
+                parse_track(copy(track_name), track)
+        elif element.tag == "track-spec":
+            parse_track("", element)
+    return annotation_map
+
+
+class Video(Dataset):
+    def __init__(self, path, annotation_map, ros_topics=None, transform=None):
         self.transform = transform
         self.frames = []
-        self.annotation_map = annotation_map
-        videos = []
-        # find all directories containing valid data
-        for root, dir, files in os.walk(root_dir):
-            if os.path.basename(os.path.normpath(root)) == "frames":
-                files.sort()
-                base_directory = Path(root).parent
-                videos.append({"base_directory": str(base_directory),
-                               "annotation_file": os.path.join(base_directory, "annotation.anvil"),
-                               "rosbag": os.path.join(base_directory, "recording.bag"),
-                               "frames": list(
-                                   {"path": os.path.join(root, file),
-                                    "is_last": i == len(files) - 1,
+
+        annotation_file = os.path.join(path, "annotation.anvil")
+        frames_dir = os.path.join(path, "frames")
+        if not os.path.exists(annotation_file) or not os.path.exists(frames_dir):
+            raise FileNotFoundError()
+        for file in os.listdir(frames_dir):
+            file_full_path = os.path.join(frames_dir, file)
+            if os.path.isfile(file_full_path) and file.endswith(".png"):
+                self.frames.append({"path": os.path.join(frames_dir, file),
                                     "sensor_data": {},
-                                    "targets": {}} for i, file in enumerate(files))
-                               })
-        broken_videos = []
-        for i, video in enumerate(videos):
-            total_frames = len(video["frames"])
-            if ros_topic_filter is not None:
-                # load rosbag
-                if not os.path.exists(video["rosbag"]):
-                    broken_videos.append(video["base_directory"])
-                    continue
-                sensor_data = load_rosbag(video["rosbag"], ros_topic_filter)
-                if not sensor_data or len(sensor_data[0]) != len(ros_topic_filter):
-                    broken_videos.append(video["base_directory"])
-                    continue
-                sensor_data_length = len(sensor_data)
-                if sensor_data_length == 0:
-                    broken_videos.append(video["base_directory"])
-                    continue
-                if sensor_data_length < total_frames:
-                    video["frames"] = video["frames"][:sensor_data_length]
-                    video["frames"][-1]["is_last"] = True
-                    total_frames = sensor_data_length
-                for j in range(total_frames):
-                    video["frames"][j]["sensor_data"] = torch.concat(list(sensor_data[j].values())).to(torch.float32)
-            # load annotation
-            create_annotation_map = self.annotation_map is None
-            if create_annotation_map:
-                self.annotation_map = OrderedDict()
-            if not os.path.exists(video["annotation_file"]):
-                broken_videos.append(video["base_directory"])
-                continue
-            for annotation in load_anvil_annotation(video["annotation_file"]):
-                track = str.lower(annotation["Track"])
-                if create_annotation_map:
-                    if track not in self.annotation_map:
-                        self.annotation_map[track] = OrderedDict()
-                    for k in annotation:
-                        if k not in ["Track", "Index", "Start", "End"]:
-                            k_lc = str.lower(k)
-                            if k_lc not in self.annotation_map[track]:
-                                self.annotation_map[track][k_lc] = []
-                            label = str.lower(annotation[k])
-                            if label not in self.annotation_map[track][k_lc]:
-                                self.annotation_map[track][k_lc].append(label)
-                start = int(VIDEO_FPS * float(annotation["Start"]))
-                end = int(VIDEO_FPS * float(annotation["End"]))
-                if total_frames < end:
-                    end = total_frames
-                for j in range(start, end):
-                    video["frames"][j]["targets"][str.lower(annotation["Track"])] = {
-                        str.lower(k): str.lower(annotation[k]) for k in annotation if
-                        k not in ["Track", "Index", "Start", "End"]}
-            self.frames += video["frames"]
-            print(f"\rLoading data ({int(((i + 1) / len(videos)) * 100)}%)", end="")
-        log_message = f"\rLoaded {len(videos) - len(broken_videos)} videos. "
-        if broken_videos:
-            log_message += f"{broken_videos} were skipped due to missing sensor data and/or annotations."
-        print(log_message)
+                                    "targets": {}})
+        if ros_topics is not None:
+            # load rosbag
+            ros_bag = os.path.join(path, "recording.bag")
+            if not os.path.exists(ros_bag):
+                raise FileNotFoundError()
+            sensor_data = load_rosbag(ros_bag, ros_topics)
+            if not sensor_data or len(sensor_data[0]) != len(ros_topics):
+                raise ValueError()
+            sensor_data_length = len(sensor_data)
+            if sensor_data_length == 0:
+                raise ValueError()
+            if sensor_data_length < len(self.frames):
+                self.frames = self.frames[:sensor_data_length]
+            for j in range(len(self.frames)):
+                self.frames[j]["sensor_data"] = torch.concat(list(sensor_data[j].values())).to(torch.float32)
+        # load annotation
+        if not os.path.exists(annotation_file):
+            raise FileNotFoundError()
+        for annotation in load_anvil_annotation(annotation_file):
+            start = int(VIDEO_FPS * float(annotation["Start"]))
+            end = int(VIDEO_FPS * float(annotation["End"]))
+            if len(self.frames) < end:
+                end = len(self.frames)
+            for j in range(start, end):
+                self.frames[j]["targets"][str.lower(annotation["Track"])] = {
+                    str.lower(k): str.lower(annotation[k]) for k in annotation if
+                    k not in ["Track", "Index", "Start", "End"]}
+
         # create target encodings
-        self.annotation_map = OrderedDict(sorted(self.annotation_map.items(), key=lambda t: t[0]))
-        self.class_groups = []
-        self.class_names = []
-        for track in self.annotation_map:
-            self.annotation_map[track] = OrderedDict(sorted(self.annotation_map[track].items(), key=lambda t: t[0]))
-            for label in self.annotation_map[track]:
-                self.annotation_map[track][label].sort()
-                self.class_groups.append(1)
-                for possible_value in self.annotation_map[track][label]:
-                    self.class_groups[-1] += 1
-                    self.class_names.append(f"{str.lower(track)}.{str.lower(label)}:{possible_value}")
-                self.class_names.append(f"{str.lower(track)}.{str.lower(label)}:not_present")
         for frame in self.frames:
             encoding = []
-            for track in list(self.annotation_map.keys()):
-                for label in self.annotation_map[track]:
+            for track in annotation_map.keys():
+                for label in annotation_map[track]:
                     actual_value = frame["targets"][track][label] if track in frame["targets"] and label in \
                                                                      frame["targets"][track] else ""
                     not_present = True
-                    for possible_value in self.annotation_map[track][label]:
-                        equals = actual_value == possible_value
-                        not_present = not_present and not equals
-                        encoding.append(int(equals))
-                    encoding.append(not_present)
+                    for possible_value in annotation_map[track][label]:
+                        if possible_value == "not present":
+                            encoding.append(int(not_present))
+                        else:
+                            equals = actual_value == possible_value
+                            not_present = not_present and not equals
+                            encoding.append(int(equals))
             frame["targets"] = torch.tensor(encoding, device="cpu", dtype=torch.float32)
         self.target_size = self.frames[0]["targets"].size(0)
-
 
     def __len__(self):
         return len(self.frames)
@@ -199,11 +195,34 @@ class ActionDataset(Dataset):
     def __getitem__(self, index):
         if torch.is_tensor(index):
             index = index.value()
-
         sample = self.frames[index]
         sample["image"] = torchvision.io.read_image(sample["path"]).to(torch.float32)
-
         if self.transform:
             sample["image"] = self.transform(sample["image"])
-
         return sample
+
+
+def load_data(root_dir, annotation_map, ros_topics=None, batch_size=1, transform=None, shuffle=False, concat=False):
+    # find all directories containing valid data
+    videos_dirs = []
+    loaded_videos = []
+    broken_videos = []
+    for root, dir, files in os.walk(root_dir):
+        if os.path.basename(os.path.normpath(root)) == "frames":
+            files.sort()
+            base_directory = Path(root).parent
+            videos_dirs.append(base_directory)
+    # load videos
+    for dir in videos_dirs:
+        try:
+            loaded_videos.append(Video(dir, annotation_map, ros_topics=ros_topics, transform=transform))
+            print(f"\rLoading data: {int((len(loaded_videos) + len(broken_videos)) / len(videos_dirs) * 100)}%", end="")
+        except (FileNotFoundError, ValueError):
+            broken_videos.append(dir)
+    log_string = f"\rLoaded data in {root_dir}"
+    if len(broken_videos):
+        log_string += f" :{len(broken_videos)} of {len(broken_videos) + len(loaded_videos)} failed."
+    print(log_string)
+    if concat:
+        loaded_videos = [ConcatDataset(loaded_videos)]
+    return (DataLoader(video, batch_size=batch_size, shuffle=shuffle) for video in loaded_videos)
