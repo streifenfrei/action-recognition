@@ -225,4 +225,4 @@ def load_data(root_dir, annotation_map, ros_topics=None, batch_size=1, transform
     print(log_string)
     if concat:
         loaded_videos = [ConcatDataset(loaded_videos)]
-    return (DataLoader(video, batch_size=batch_size, shuffle=shuffle) for video in loaded_videos)
+    return [DataLoader(video, batch_size=batch_size, shuffle=shuffle) for video in loaded_videos]

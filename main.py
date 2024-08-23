@@ -5,13 +5,12 @@ import yaml
 import wandb
 
 import torch.nn.functional
-from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from data_loader import load_annotation_map, load_data
 from models import create_model, create_optimizer
 
-LOG_INTERVAL = 1000
+LOG_INTERVAL = 100
 
 name = None
 config = None
@@ -40,27 +39,32 @@ def get_loss_fn(annotation_map):
 
 
 def train_one_epoch():
-    running_loss = 0.
     running_loss_epoch = 0
+    i = 0
+    batch_size = None
+    total_length = sum(len(x) for x in training_loader)
+    for loader in training_loader:
+        running_loss = 0.
+        for data in loader:
+            image = data["image"]
+            batch_size = image.shape[0]
+            sensor_data = data["sensor_data"]   # not used yet
+            targets = data["targets"]
 
-    for i, data in enumerate(training_loader):
-        image = data["image"]
-        sensor_data = data["sensor_data"]
-        targets = data["targets"]
-
-        optimizer.zero_grad()
-        outputs = model(image)
-        loss = loss_fn(outputs, targets)
-        loss.backward()
-        optimizer.step()
-        running_loss += loss.item()
-        running_loss_epoch += loss.item()
-        if i % LOG_INTERVAL == LOG_INTERVAL - 1:
-            print(
-                f"\r  batch {i + 1}, loss: {running_loss / LOG_INTERVAL} ({int((i + 1) / len(training_loader) * 100)}%)",
-                end="")
-            running_loss = 0.
-    return running_loss_epoch / len(training_loader)
+            optimizer.zero_grad()
+            outputs = model(image)
+            loss = loss_fn(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+            running_loss_epoch += loss.item()
+            if i % LOG_INTERVAL == LOG_INTERVAL - 1:
+                print(
+                    f"\r  batch {i + 1}, loss: {running_loss / LOG_INTERVAL} ({int((i + 1) * batch_size / total_length * 100)}%)",
+                    end="")
+                running_loss = 0.
+            i += 1
+    return running_loss_epoch * batch_size / total_length
 
 
 def train(epoch_start, epoch_end):
@@ -108,14 +112,16 @@ if __name__ == '__main__':
     data_config = config["data"]
     annotation_map = load_annotation_map(data_config["specfile"])
     ros_topics = config["ros_topics"] if "ros_topics" in config else None
+    no_temporal_relation = config["model"]["type"] in ["resnet"]
     training_loader = load_data(data_config["training_set"], annotation_map, batch_size=config["batch_size"],
-                                ros_topics=ros_topics, shuffle=True, transform=transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ]))
+                                ros_topics=ros_topics, shuffle=no_temporal_relation, concat=no_temporal_relation,
+                                transform=transforms.Compose([
+                                    transforms.Resize(256),
+                                    transforms.CenterCrop(224),
+                                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                                ]))
     validation_loader = load_data(data_config["validation_set"], annotation_map, batch_size=config["batch_size"],
-                                  ros_topics=ros_topics, shuffle=True)
+                                  ros_topics=ros_topics, shuffle=no_temporal_relation, concat=no_temporal_relation)
     loss_fn = get_loss_fn(annotation_map)
 
     # create model and optimizer, load checkpoint
