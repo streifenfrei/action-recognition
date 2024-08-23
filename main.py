@@ -100,7 +100,7 @@ def train(epoch_start, epoch_end):
 
 if __name__ == '__main__':
     # run the script like e.g.:
-    # python ./main.py /path/to/dataset -r /eit_data_PCB4 -r /eit_data_PCB5
+    # python ./main.py -c path/to/config.yaml -n resnet1337
     argparser = argparse.ArgumentParser()
     argparser.add_argument("config", default="config.yaml")
     argparser.add_argument("-n", "--name", default="default")
